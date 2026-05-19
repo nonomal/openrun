@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"maps"
 	"net/url"
@@ -16,13 +17,26 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/openrundev/openrun/internal/types"
 )
 
-type PostgresServiceBinding struct {
-	serviceConfig map[string]string
-	bindingConfig map[string]string
+// pgUndefinedTable is the SQLSTATE code returned by Postgres when a relation
+// referenced in a statement does not exist (42P01 "relation does not exist").
+const pgUndefinedTable = "42P01"
 
-	adminConn *sql.DB // The admin connection to the main database, available after InitService
+// isUndefinedTable reports whether err is a Postgres "relation does not exist"
+// error. This is used to detect grants targeting a table that has not yet been
+// created by the base binding's role, so the grant can be deferred.
+func isUndefinedTable(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == pgUndefinedTable
+}
+
+type PostgresServiceBinding struct {
+	*types.Logger
+	serviceConfig map[string]string
+	adminConn     *sql.DB // The admin connection to the main database, available after InitService
 }
 
 func init() {
@@ -35,7 +49,8 @@ func NewPostgresServiceBinding() ServiceBinding {
 	return &PostgresServiceBinding{}
 }
 
-func (b *PostgresServiceBinding) InitService(ctx context.Context, serviceConfig map[string]string) error {
+func (b *PostgresServiceBinding) InitializeService(ctx context.Context, logger *types.Logger, serviceConfig map[string]string) error {
+	b.Logger = logger
 	if err := verifyKeys(slices.Collect(maps.Keys(serviceConfig)), []string{"url"}, []string{}); err != nil {
 		return err
 	}
@@ -55,24 +70,39 @@ func (b *PostgresServiceBinding) InitService(ctx context.Context, serviceConfig 
 	return nil
 }
 
-func (b *PostgresServiceBinding) InitBaseBinding(ctx context.Context, bindingConfig map[string]string) error {
-	if err := verifyKeys(slices.Collect(maps.Keys(bindingConfig)), []string{}, []string{"inherit_default"}); err != nil {
-		return err
+type PostgresContextKey string
+
+const POSTGRES_TRANSACTION_KEY PostgresContextKey = "postgres_sb_transaction"
+
+func (b *PostgresServiceBinding) BeginTransaction(ctx context.Context) (context.Context, error) {
+	tx, err := b.adminConn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error starting transaction: %w", err)
 	}
-	b.bindingConfig = bindingConfig
-	return nil
+	return context.WithValue(ctx, POSTGRES_TRANSACTION_KEY, tx), nil
 }
 
-func (b *PostgresServiceBinding) InitDerivedBinding(ctx context.Context, grants []string, bindingConfig map[string]string) error {
-	// TODO: Implement derived binding initialization
-	return nil
+func (b *PostgresServiceBinding) CommitTransaction(ctx context.Context) error {
+	tx, ok := ctx.Value(POSTGRES_TRANSACTION_KEY).(*sql.Tx)
+	if !ok {
+		return fmt.Errorf("transaction not found in context")
+	}
+	return tx.Commit()
 }
 
-func (b *PostgresServiceBinding) GenerateAccount(ctx context.Context, bindingId string, isStaging bool) (map[string]string, error) {
+func (b *PostgresServiceBinding) RollbackTransaction(ctx context.Context) error {
+	tx, ok := ctx.Value(POSTGRES_TRANSACTION_KEY).(*sql.Tx)
+	if !ok {
+		return fmt.Errorf("transaction not found in context")
+	}
+	return tx.Rollback()
+}
+
+func (b *PostgresServiceBinding) GenerateAccount(ctx context.Context, bindingId, bindingPath string, bindingMetadata types.BindingMetadata, derivedFromMetadata *types.BindingMetadata, isStaging bool) (map[string]string, error) {
 	inheritDefault := true
 	var err error
 
-	inheritDefaultStr, ok := b.bindingConfig["inherit_default"]
+	inheritDefaultStr, ok := bindingMetadata.Config["inherit_default"]
 	if ok {
 		inheritDefault, err = strconv.ParseBool(inheritDefaultStr)
 		if err != nil {
@@ -92,6 +122,10 @@ func (b *PostgresServiceBinding) GenerateAccount(ctx context.Context, bindingId 
 
 	schemaName := "cl_sch_" + modePrefix + bindingId
 	roleName := "cl_rol_" + modePrefix + bindingId
+	if derivedFromMetadata != nil {
+		// Derived binding, use the base binding's schema
+		schemaName = derivedFromMetadata.Account["schema"]
+	}
 
 	quotedSchema := pgx.Identifier{schemaName}.Sanitize()
 	quotedRole := pgx.Identifier{roleName}.Sanitize()
@@ -103,34 +137,38 @@ func (b *PostgresServiceBinding) GenerateAccount(ctx context.Context, bindingId 
 		roleOptions += " NOINHERIT"
 	}
 
-	tx, err := b.adminConn.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("error starting transaction: %w", err)
+	tx, ok := ctx.Value(POSTGRES_TRANSACTION_KEY).(*sql.Tx)
+	if !ok {
+		return nil, fmt.Errorf("transaction not found in context")
 	}
-	defer tx.Rollback() //nolint:errcheck
 
 	createRoleSQL := fmt.Sprintf("CREATE ROLE %s WITH %s PASSWORD %s", quotedRole, roleOptions, quotedPassword)
 	if _, err := tx.ExecContext(ctx, createRoleSQL); err != nil {
 		return nil, fmt.Errorf("error creating role %s: %w", roleName, err)
 	}
 
-	createSchemaSQL := fmt.Sprintf("CREATE SCHEMA %s AUTHORIZATION %s", quotedSchema, quotedRole)
-	if _, err := tx.ExecContext(ctx, createSchemaSQL); err != nil {
-		return nil, fmt.Errorf("error creating schema %s: %w", schemaName, err)
-	}
+	if derivedFromMetadata == nil {
+		// Base binding, create a new schema
+		createSchemaSQL := fmt.Sprintf("CREATE SCHEMA %s AUTHORIZATION %s", quotedSchema, quotedRole)
+		if _, err := tx.ExecContext(ctx, createSchemaSQL); err != nil {
+			return nil, fmt.Errorf("error creating schema %s: %w", schemaName, err)
+		}
 
-	grantSQL := fmt.Sprintf("GRANT ALL ON SCHEMA %s TO %s", quotedSchema, quotedRole)
-	if _, err := tx.ExecContext(ctx, grantSQL); err != nil {
-		return nil, fmt.Errorf("error granting privileges on schema %s: %w", schemaName, err)
+		grantSQL := fmt.Sprintf("GRANT ALL ON SCHEMA %s TO %s", quotedSchema, quotedRole)
+		if _, err := tx.ExecContext(ctx, grantSQL); err != nil {
+			return nil, fmt.Errorf("error granting privileges on schema %s: %w", schemaName, err)
+		}
+	} else {
+		// Derived binding, grant usage on the base binding's schema
+		grantUsageSQL := fmt.Sprintf("GRANT USAGE ON SCHEMA %s TO %s", quotedSchema, quotedRole)
+		if _, err := tx.ExecContext(ctx, grantUsageSQL); err != nil {
+			return nil, fmt.Errorf("error granting usage privileges on schema %s: %w", schemaName, err)
+		}
 	}
 
 	setSearchPathSQL := fmt.Sprintf("ALTER ROLE %s SET search_path = %s", quotedRole, quotedSchema)
 	if _, err := tx.ExecContext(ctx, setSearchPathSQL); err != nil {
 		return nil, fmt.Errorf("error setting search_path on role %s: %w", roleName, err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("error committing account creation: %w", err)
 	}
 
 	accountURL, err := buildAccountURL(b.serviceConfig["url"], roleName, password, schemaName)
@@ -143,6 +181,226 @@ func (b *PostgresServiceBinding) GenerateAccount(ctx context.Context, bindingId 
 		"schema": schemaName,
 		"role":   roleName,
 	}, nil
+}
+
+func (b *PostgresServiceBinding) ApplyGrants(ctx context.Context, account map[string]string, bindingMetadata types.BindingMetadata,
+	derivedFromMetadata types.BindingMetadata, reapplyAll bool) ([]types.BindingGrant, error) {
+	if err := verifyKeys(slices.Collect(maps.Keys(bindingMetadata.Config)), []string{}, []string{"inherit_default"}); err != nil {
+		return nil, err
+	}
+
+	tx, ok := ctx.Value(POSTGRES_TRANSACTION_KEY).(*sql.Tx)
+	if !ok {
+		return nil, fmt.Errorf("transaction not found in context")
+	}
+
+	grantsProcessed, err := b.processGrants(ctx, tx, account["role"], account["schema"], derivedFromMetadata.Account["role"], bindingMetadata, reapplyAll)
+	if err != nil {
+		return nil, fmt.Errorf("error processing grants: %w", err)
+	}
+
+	return grantsProcessed, nil
+}
+
+func (b *PostgresServiceBinding) processGrants(ctx context.Context, tx *sql.Tx, role, schema string,
+	baseRoleName string, bindingMetadata types.BindingMetadata, reapplyAll bool) ([]types.BindingGrant, error) {
+	quotedSchema := pgx.Identifier{schema}.Sanitize()
+	quotedRole := pgx.Identifier{role}.Sanitize()
+	quotedBaseRole := pgx.Identifier{baseRoleName}.Sanitize()
+
+	bindingGrants, err := parseGrants(bindingMetadata.Grants, []types.GrantType{types.GrantTypeRead, types.GrantTypeCreate, types.GrantTypeFull})
+	if err != nil {
+		return nil, fmt.Errorf("error parsing grants: %w", err)
+	}
+
+	revokedGrants, applyGrants := diffGrants(bindingMetadata.GrantsApplied, bindingGrants)
+	_, err = b.applyPerms(ctx, tx, "revoke", revokedGrants, quotedSchema, quotedRole, schema, quotedBaseRole)
+	if err != nil {
+		return nil, fmt.Errorf("error revoking grants: %w", err)
+	}
+
+	if reapplyAll {
+		applyGrants = bindingGrants // Apply all grants, can help when new tables are present which need to be granted to the role
+	}
+
+	grantsProcessed, err := b.applyPerms(ctx, tx, "grant", applyGrants, quotedSchema, quotedRole, schema, quotedBaseRole)
+	if err != nil {
+		return nil, fmt.Errorf("error applying new grants: %w", err)
+	}
+	b.Debug().Msgf("processed grants %v", grantsProcessed)
+
+	if reapplyAll {
+		// Return list of grants that were applied
+		return grantsProcessed, nil
+	} else {
+		grantsApplied := []types.BindingGrant{}
+		grantsApplied = append(grantsApplied, bindingMetadata.GrantsApplied...)
+		for _, grant := range grantsProcessed {
+			if !slices.Contains(grantsApplied, grant) {
+				grantsApplied = append(grantsApplied, grant)
+			}
+		}
+
+		for _, grant := range revokedGrants {
+			index := slices.Index(grantsApplied, grant)
+			if index != -1 {
+				// Remove the grant from the list of applied grants
+				grantsApplied = slices.Delete(grantsApplied, index, index+1)
+			}
+		}
+		return grantsApplied, nil
+	}
+}
+
+// applyPerms runs GRANT or REVOKE statements for binding grants.
+// operation must be "grant" or "revoke".
+func (b *PostgresServiceBinding) applyPerms(ctx context.Context, tx *sql.Tx, operation string,
+	grants []types.BindingGrant, quotedSchema string, quotedRole string, schema string, quotedBaseRole string) ([]types.BindingGrant, error) {
+	var isGrant bool
+	switch operation {
+	case "grant":
+		isGrant = true
+	case "revoke":
+		isGrant = false
+	default:
+		return nil, fmt.Errorf("invalid grant operation %q: want %q or %q", operation, "grant", "revoke")
+	}
+	grantOrRevoke := "REVOKE"
+	toOrFrom := "FROM"
+	verb := "revoking"
+	if isGrant {
+		grantOrRevoke = "GRANT"
+		toOrFrom = "TO"
+		verb = "granting"
+	}
+
+	grantsDone := []types.BindingGrant{}
+	for i, grant := range grants {
+		switch grant.GrantType {
+		case types.GrantTypeRead:
+			if grant.GrantTarget == types.GrantTargetAll {
+				stmt := fmt.Sprintf("%s SELECT ON ALL TABLES IN SCHEMA %s %s %s", grantOrRevoke, quotedSchema, toOrFrom, quotedRole)
+				if _, err := tx.ExecContext(ctx, stmt); err != nil {
+					return nil, fmt.Errorf("error %s select privileges on all tables in schema %s: %w", verb, schema, err)
+				}
+
+				stmt = fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR ROLE %s IN SCHEMA %s %s SELECT ON TABLES %s %s", quotedBaseRole, quotedSchema, grantOrRevoke, toOrFrom, quotedRole)
+				if _, err := tx.ExecContext(ctx, stmt); err != nil {
+					return nil, fmt.Errorf("error %s default select privileges on all tables in schema %s: %w", verb, schema, err)
+				}
+				grantsDone = append(grantsDone, grant)
+			} else {
+				quotedTableName := pgx.Identifier{schema, grant.GrantTarget}.Sanitize()
+				stmt := fmt.Sprintf("%s SELECT ON TABLE %s %s %s", grantOrRevoke, quotedTableName, toOrFrom, quotedRole)
+				applied, err := b.trySoftGrant(ctx, tx, savepointName(operation, i), stmt)
+				if err != nil {
+					return nil, fmt.Errorf("error %s select privileges on table %s.%s: %w", verb, schema, grant.GrantTarget, err)
+				}
+				if applied {
+					grantsDone = append(grantsDone, grant)
+				} else if isGrant {
+					b.Warn().Str("grant", grant.String()).Str("schema", schema).Str("table", grant.GrantTarget).
+						Msg("table does not exist yet; grant deferred until reconcile")
+				} else {
+					b.Warn().Str("grant", grant.String()).Str("schema", schema).Str("table", grant.GrantTarget).
+						Msg("table does not exist; revoke skipped")
+				}
+			}
+
+		case types.GrantTypeCreate:
+			if isGrant && grant.GrantTarget != "" && grant.GrantTarget != types.GrantTargetAll {
+				return nil, fmt.Errorf("create grant on specific table is not supported")
+			}
+			stmt := fmt.Sprintf("%s CREATE ON SCHEMA %s %s %s", grantOrRevoke, quotedSchema, toOrFrom, quotedRole)
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				return nil, fmt.Errorf("error %s create privileges on schema %s: %w", verb, schema, err)
+			}
+			grantsDone = append(grantsDone, grant)
+
+		case types.GrantTypeFull:
+			if grant.GrantTarget == types.GrantTargetAll {
+				stmt := fmt.Sprintf("%s ALL ON ALL TABLES IN SCHEMA %s %s %s", grantOrRevoke, quotedSchema, toOrFrom, quotedRole)
+				if _, err := tx.ExecContext(ctx, stmt); err != nil {
+					return nil, fmt.Errorf("error %s full privileges on all tables in schema %s: %w", verb, schema, err)
+				}
+
+				stmt = fmt.Sprintf("%s ALL ON ALL SEQUENCES IN SCHEMA %s %s %s", grantOrRevoke, quotedSchema, toOrFrom, quotedRole)
+				if _, err := tx.ExecContext(ctx, stmt); err != nil {
+					return nil, fmt.Errorf("error %s full privileges on all sequences in schema %s: %w", verb, schema, err)
+				}
+
+				stmt = fmt.Sprintf("%s CREATE ON SCHEMA %s %s %s", grantOrRevoke, quotedSchema, toOrFrom, quotedRole)
+				if _, err := tx.ExecContext(ctx, stmt); err != nil {
+					return nil, fmt.Errorf("error %s create privileges on schema %s: %w", verb, schema, err)
+				}
+
+				stmt = fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR ROLE %s IN SCHEMA %s %s ALL ON TABLES %s %s", quotedBaseRole, quotedSchema, grantOrRevoke, toOrFrom, quotedRole)
+				if _, err := tx.ExecContext(ctx, stmt); err != nil {
+					return nil, fmt.Errorf("error %s default full privileges on all tables in schema %s: %w", verb, schema, err)
+				}
+
+				stmt = fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR ROLE %s IN SCHEMA %s %s ALL ON SEQUENCES %s %s", quotedBaseRole, quotedSchema, grantOrRevoke, toOrFrom, quotedRole)
+				if _, err := tx.ExecContext(ctx, stmt); err != nil {
+					return nil, fmt.Errorf("error %s default full privileges on all sequences in schema %s: %w", verb, schema, err)
+				}
+				grantsDone = append(grantsDone, grant)
+			} else {
+				quotedTableName := pgx.Identifier{schema, grant.GrantTarget}.Sanitize()
+				stmt := fmt.Sprintf("%s ALL ON TABLE %s %s %s", grantOrRevoke, quotedTableName, toOrFrom, quotedRole)
+				applied, err := b.trySoftGrant(ctx, tx, savepointName(operation, i), stmt)
+				if err != nil {
+					return nil, fmt.Errorf("error %s full privileges on table %s.%s: %w", verb, schema, grant.GrantTarget, err)
+				}
+				if applied {
+					grantsDone = append(grantsDone, grant)
+				} else if isGrant {
+					b.Warn().Str("grant", grant.String()).Str("schema", schema).Str("table", grant.GrantTarget).
+						Msg("table does not exist yet; grant deferred until reconcile")
+				} else {
+					b.Warn().Str("grant", grant.String()).Str("schema", schema).Str("table", grant.GrantTarget).
+						Msg("table does not exist; revoke skipped")
+				}
+			}
+		}
+	}
+	return grantsDone, nil
+}
+
+func savepointName(prefix string, i int) string {
+	return fmt.Sprintf("%s_sp_%d", prefix, i)
+}
+
+// trySoftGrant runs a single GRANT or REVOKE statement inside a SAVEPOINT so that a
+// "relation does not exist" error (42P01) does not poison the surrounding
+// transaction.
+func (b *PostgresServiceBinding) trySoftGrant(ctx context.Context, tx *sql.Tx, name, stmt string) (bool, error) {
+	if _, err := tx.ExecContext(ctx, "SAVEPOINT "+name); err != nil {
+		return false, fmt.Errorf("error creating savepoint %s: %w", name, err)
+	}
+
+	if _, err := tx.ExecContext(ctx, stmt); err != nil {
+		if !isUndefinedTable(err) {
+			// Real error: the outer transaction is now aborted by Postgres.
+			// Surface the original error so callers can bail out cleanly.
+			return false, err
+		}
+
+		// Target relation does not exist yet. Undo the failed statement so the
+		// outer transaction can continue, then release the savepoint to keep
+		// the savepoint stack bounded for callers running many grants.
+		if _, rerr := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT "+name); rerr != nil {
+			return false, fmt.Errorf("error rolling back to savepoint %s after %w: %w", name, err, rerr)
+		}
+		if _, rerr := tx.ExecContext(ctx, "RELEASE SAVEPOINT "+name); rerr != nil {
+			return false, fmt.Errorf("error releasing savepoint %s after rollback: %w", name, rerr)
+		}
+		return false, nil
+	}
+
+	if _, err := tx.ExecContext(ctx, "RELEASE SAVEPOINT "+name); err != nil {
+		return false, fmt.Errorf("error releasing savepoint %s: %w", name, err)
+	}
+	return true, nil
 }
 
 func randomHex(n int) (string, error) {

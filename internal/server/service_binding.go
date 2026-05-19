@@ -6,6 +6,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/openrundev/openrun/internal/bindings"
@@ -57,7 +58,7 @@ func (s *Server) CreateService(ctx context.Context, service *types.Service, dryR
 	}
 
 	serviceBinding := builder()
-	if err := serviceBinding.InitService(ctx, service.Config); err != nil {
+	if err := serviceBinding.InitializeService(ctx, s.Logger, service.Config); err != nil {
 		return fmt.Errorf("error initializing service binding: %w", err)
 	}
 
@@ -167,21 +168,41 @@ func (s *Server) CreateBinding(ctx context.Context, binding *types.Binding, dryR
 	if binding.Source == "" {
 		return fmt.Errorf("binding source is required")
 	}
+	binding.StagedMetadata.Grants = normalizeGrantList(binding.StagedMetadata.Grants)
 
 	var service *types.Service
+	var derivedFrom *types.Binding
 	if strings.HasPrefix(binding.Source, "/") {
 		// Reference another binding by path - derived binding
-		baseBinding, err := s.db.GetBinding(ctx, tx, binding.Source)
+		derivedFrom, err = s.db.GetBinding(ctx, tx, binding.Source)
 		if err != nil {
 			return fmt.Errorf("binding source %s not found", binding.Source)
 		}
 
-		binding.ServiceType = baseBinding.ServiceType
-		binding.ServiceName = baseBinding.ServiceName
-		binding.BaseBinding = binding.Source
-		// TODO: Implement derived binding initialization
+		// Reject multi-level nesting. A derived binding must be derived from a
+		// base binding (one whose Source points at a service, not at another
+		// binding). Allowing derived-of-derived would make ALTER DEFAULT
+		// PRIVILEGES reference the wrong creator role
+		if derivedFrom.DerivedFrom != "" {
+			return fmt.Errorf(
+				"cannot derive binding %s from another derived binding %s; "+
+					"derive from the base binding %s instead",
+				binding.Path, derivedFrom.Path, derivedFrom.DerivedFrom)
+		}
+
+		binding.ServiceType = derivedFrom.ServiceType
+		binding.ServiceName = derivedFrom.ServiceName
+		binding.DerivedFrom = binding.Source
+
+		service, err = s.db.GetService(ctx, tx, derivedFrom.ServiceType, derivedFrom.ServiceName)
+		if err != nil {
+			return fmt.Errorf("error getting base binding service: %w", err)
+		}
 	} else {
 		// Base binding
+		if len(binding.StagedMetadata.Grants) > 0 {
+			return fmt.Errorf("grants are not supported for base bindings, only derived bindings can have grants")
+		}
 		serviceType, name, ok := strings.Cut(binding.Source, "/")
 		if !ok {
 			// Reference a service by type alone
@@ -199,7 +220,7 @@ func (s *Server) CreateBinding(ctx context.Context, binding *types.Binding, dryR
 
 		binding.ServiceType = service.ServiceType
 		binding.ServiceName = service.Name
-		binding.BaseBinding = ""
+		binding.DerivedFrom = ""
 	}
 	binding.Metadata = binding.StagedMetadata
 
@@ -207,72 +228,26 @@ func (s *Server) CreateBinding(ctx context.Context, binding *types.Binding, dryR
 		return err
 	}
 
-	if dryRun {
-		return nil
+	stagingService := service
+	if service.Staging != "" {
+		stagingService, err = s.db.GetService(ctx, tx, service.ServiceType, service.Staging)
+		if err != nil {
+			return fmt.Errorf("error getting staging service: %w", err)
+		}
 	}
 
 	// Not dry run, generate the account info
-	if binding.BaseBinding == "" {
-		// Generate the base binding
-		stagingService := service
-		if service.Staging != "" {
-			stagingService, err = s.db.GetService(ctx, tx, service.ServiceType, service.Staging)
-			if err != nil {
-				return fmt.Errorf("error getting staging service: %w", err)
-			}
-		}
-
-		// Generate the staging account info, either against the staging service if set or against the main service
-		stagingAccount, err := s.generateBaseBindingAccount(ctx, stagingService, binding.Id, binding.Metadata.Config, true)
-		if err != nil {
-			return fmt.Errorf("error generating staging account: %w", err)
-		}
-		binding.StagedMetadata.Account = stagingAccount
-
-		// Generate the production account info
-		// This runs as a separate transaction, since it might not be against same database as the metadata database
-		account, err := s.generateBaseBindingAccount(ctx, service, binding.Id, binding.Metadata.Config, false)
-		if err != nil {
-			return err
-		}
-		binding.Metadata.Account = account
-		if err := s.db.UpdateBinding(ctx, tx, binding); err != nil {
-			return err
-		}
-	} else {
-		// TODO: Implement derived binding account generation
-		return nil
+	// Generate the staging account info, either against the staging service if set or against the main service
+	binding.StagedMetadata.Account, binding.StagedMetadata.GrantsApplied, err = s.generateAccount(ctx, dryRun, stagingService, binding, derivedFrom, true, true)
+	if err != nil {
+		return fmt.Errorf("error generating staging account: %w", err)
 	}
 
-	return tx.Commit()
-}
-
-func (s *Server) generateBaseBindingAccount(ctx context.Context, service *types.Service, bindingId string, bindingConfig map[string]string, isStaging bool) (map[string]string, error) {
-	builder, ok := bindings.ServiceBindings[service.ServiceType]
-	if !ok {
-		return nil, fmt.Errorf("unknown service type: %s", service.ServiceType)
-	}
-
-	serviceBinding := builder()
-	if err := serviceBinding.InitService(ctx, service.Config); err != nil {
-		return nil, fmt.Errorf("error initializing service: %w", err)
-	}
-	if err := serviceBinding.InitBaseBinding(ctx, bindingConfig); err != nil {
-		return nil, fmt.Errorf("error initializing base binding: %w", err)
-	}
-
-	return serviceBinding.GenerateAccount(ctx, bindingId, isStaging)
-}
-
-func (s *Server) UpdateBinding(ctx context.Context, binding *types.Binding, dryRun, promote bool) error {
-	tx, err := s.db.BeginTransaction(ctx)
+	// Generate the production account info
+	// This runs as a separate transaction, since it might not be against same database as the metadata database
+	binding.Metadata.Account, binding.Metadata.GrantsApplied, err = s.generateAccount(ctx, dryRun, service, binding, derivedFrom, false, true)
 	if err != nil {
 		return err
-	}
-	defer tx.Rollback() //nolint:errcheck
-
-	if promote {
-		binding.Metadata = binding.StagedMetadata
 	}
 	if err := s.db.UpdateBinding(ctx, tx, binding); err != nil {
 		return err
@@ -281,7 +256,202 @@ func (s *Server) UpdateBinding(ctx context.Context, binding *types.Binding, dryR
 	if dryRun {
 		return nil
 	}
+
 	return tx.Commit()
+}
+
+func (s *Server) generateAccount(ctx context.Context, dryRun bool, service *types.Service, binding *types.Binding, derivedFrom *types.Binding, isStaging, reapplyAll bool) (map[string]string, []types.BindingGrant, error) {
+	builder, ok := bindings.ServiceBindings[service.ServiceType]
+	if !ok {
+		return nil, nil, fmt.Errorf("unknown service type: %s", service.ServiceType)
+	}
+
+	var err error
+	serviceBinding := builder()
+	if err = serviceBinding.InitializeService(ctx, s.Logger, service.Config); err != nil {
+		return nil, nil, fmt.Errorf("error initializing service: %w", err)
+	}
+
+	metadata := binding.Metadata
+	if isStaging {
+		metadata = binding.StagedMetadata
+	}
+
+	var derivedFromMetadata *types.BindingMetadata
+	if derivedFrom != nil {
+		derivedFromMetadata = &derivedFrom.Metadata
+		if isStaging {
+			derivedFromMetadata = &derivedFrom.StagedMetadata
+		}
+	}
+
+	ctx, err = serviceBinding.BeginTransaction(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("error beginning transaction: %w", err)
+	}
+	defer serviceBinding.RollbackTransaction(ctx) //nolint:errcheck
+
+	account, err := serviceBinding.GenerateAccount(ctx, binding.Id, binding.Path, metadata, derivedFromMetadata, isStaging)
+	if err != nil {
+		return nil, nil, fmt.Errorf("error generating account: %w", err)
+	}
+
+	grantsApplied := []types.BindingGrant{}
+	if derivedFrom != nil {
+		grantsApplied, err = serviceBinding.ApplyGrants(ctx, account, metadata, *derivedFromMetadata, reapplyAll)
+		if err != nil {
+			return nil, nil, fmt.Errorf("error applying grants: %w", err)
+		}
+	}
+
+	if !dryRun {
+		if err := serviceBinding.CommitTransaction(ctx); err != nil {
+			return nil, nil, fmt.Errorf("error committing transaction: %w", err)
+		}
+	}
+
+	return account, grantsApplied, nil
+}
+
+func (s *Server) applyBindingGrants(ctx context.Context, dryRun bool, service *types.Service,
+	binding *types.Binding, derivedFrom *types.Binding, isStaging bool, reapplyAll bool) ([]types.BindingGrant, error) {
+	builder, ok := bindings.ServiceBindings[service.ServiceType]
+	if !ok {
+		return nil, fmt.Errorf("unknown service type: %s", service.ServiceType)
+	}
+
+	serviceBinding := builder()
+	if err := serviceBinding.InitializeService(ctx, s.Logger, service.Config); err != nil {
+		return nil, fmt.Errorf("error initializing service: %w", err)
+	}
+
+	metadata := binding.Metadata
+	if isStaging {
+		metadata = binding.StagedMetadata
+	}
+
+	derivedFromMetadata := derivedFrom.Metadata
+	if isStaging {
+		derivedFromMetadata = derivedFrom.StagedMetadata
+	}
+
+	ctx, err := serviceBinding.BeginTransaction(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("error beginning transaction: %w", err)
+	}
+	defer serviceBinding.RollbackTransaction(ctx) //nolint:errcheck
+
+	grantsApplied, err := serviceBinding.ApplyGrants(ctx, metadata.Account, metadata, derivedFromMetadata, reapplyAll)
+	if err != nil {
+		return nil, fmt.Errorf("error applying grants: %w", err)
+	}
+
+	if !dryRun {
+		if err := serviceBinding.CommitTransaction(ctx); err != nil {
+			return nil, fmt.Errorf("error committing transaction: %w", err)
+		}
+	}
+
+	return grantsApplied, nil
+}
+
+func normalizeGrantForStorage(grant string) string {
+	grantType, grantTarget, ok := strings.Cut(grant, ":")
+	if !ok {
+		return strings.TrimSpace(grant)
+	}
+	return strings.ToLower(strings.TrimSpace(grantType)) + ":" + strings.TrimSpace(grantTarget)
+}
+
+func normalizeGrantList(grants []string) []string {
+	normalized := make([]string, 0, len(grants))
+	for _, grant := range grants {
+		normalizedGrant := normalizeGrantForStorage(grant)
+		if !slices.Contains(normalized, normalizedGrant) {
+			normalized = append(normalized, normalizedGrant)
+		}
+	}
+	return normalized
+}
+
+func mergeGrantUpdates(current, addGrants, deleteGrants []string) []string {
+	merged := normalizeGrantList(current)
+	for _, grant := range normalizeGrantList(deleteGrants) {
+		for {
+			index := slices.Index(merged, grant)
+			if index == -1 {
+				break
+			}
+			merged = slices.Delete(merged, index, index+1)
+		}
+	}
+	for _, grant := range normalizeGrantList(addGrants) {
+		if !slices.Contains(merged, grant) {
+			merged = append(merged, grant)
+		}
+	}
+	return merged
+}
+
+func (s *Server) UpdateBinding(ctx context.Context, updateRequest types.UpdateBindingRequest, dryRun, promote bool) (*types.Binding, error) {
+	if len(updateRequest.AddGrants) == 0 && len(updateRequest.DeleteGrants) == 0 && !promote {
+		return nil, fmt.Errorf("expected at least one grant update or promote")
+	}
+
+	tx, err := s.db.BeginTransaction(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	binding, err := s.db.GetBinding(ctx, tx, updateRequest.Path)
+	if err != nil {
+		return nil, err
+	}
+	if binding.DerivedFrom == "" {
+		return nil, fmt.Errorf("grants are not supported for base bindings, only derived bindings can have grants")
+	}
+
+	derivedFrom, err := s.db.GetBinding(ctx, tx, binding.DerivedFrom)
+	if err != nil {
+		return nil, fmt.Errorf("base binding %s not found: %w", binding.DerivedFrom, err)
+	}
+
+	service, err := s.db.GetService(ctx, tx, binding.ServiceType, binding.ServiceName)
+	if err != nil {
+		return nil, fmt.Errorf("error getting binding service: %w", err)
+	}
+
+	binding.StagedMetadata.Grants = mergeGrantUpdates(binding.StagedMetadata.Grants, updateRequest.AddGrants, updateRequest.DeleteGrants)
+
+	stagingService := service
+	if service.Staging != "" {
+		stagingService, err = s.db.GetService(ctx, tx, service.ServiceType, service.Staging)
+		if err != nil {
+			return nil, fmt.Errorf("error getting staging service: %w", err)
+		}
+	}
+	binding.StagedMetadata.GrantsApplied, err = s.applyBindingGrants(ctx, dryRun, stagingService, binding, derivedFrom, true, false)
+	if err != nil {
+		return nil, fmt.Errorf("error applying staging grants: %w", err)
+	}
+
+	if promote {
+		binding.Metadata.Grants = binding.StagedMetadata.Grants
+		binding.Metadata.GrantsApplied, err = s.applyBindingGrants(ctx, dryRun, service, binding, derivedFrom, false, false)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if err := s.db.UpdateBinding(ctx, tx, binding); err != nil {
+		return nil, err
+	}
+
+	if dryRun {
+		return binding, nil
+	}
+	return binding, tx.Commit()
 }
 
 func (s *Server) DeleteBinding(ctx context.Context, path string, dryRun bool) error {

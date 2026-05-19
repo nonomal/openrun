@@ -54,6 +54,8 @@ type ContextKey string
 
 const (
 	USER_ID         ContextKey = "user_id"
+	USER_SUBJECT    ContextKey = "user_subject"
+	USER_EMAIL      ContextKey = "user_email"
 	SHARED          ContextKey = "shared"
 	REQUEST_ID      ContextKey = "request_id"
 	APP_ID          ContextKey = "app_id"
@@ -287,6 +289,7 @@ type SystemConfig struct {
 	WatchIgnorePatterns                 []string `toml:"watch_ignore_patterns"`
 	NodePath                            string   `toml:"node_path"`
 	ContainerCommand                    string   `toml:"container_command"`
+	StaleContainerCleanupIntervalMins   int      `toml:"stale_container_cleanup_interval_mins"` // Interval for stale OpenRun container cleanup. Set <=0 to disable.
 	ContainerBuilder                    string   `toml:"container_builder"`
 	DefaultDomain                       string   `toml:"default_domain"`
 	RootServeListApps                   string   `toml:"root_serve_list_apps"`
@@ -862,6 +865,8 @@ const (
 	// OpenRun headers are used to pass information to the downstream service
 	OPENRUN_HEADER_PREFIX           = "X-Openrun-"
 	OPENRUN_HEADER_USER             = OPENRUN_HEADER_PREFIX + "User"
+	OPENRUN_HEADER_USER_ID          = OPENRUN_HEADER_PREFIX + "User-Id"
+	OPENRUN_HEADER_USER_EMAIL       = OPENRUN_HEADER_PREFIX + "User-Email"
 	OPENRUN_HEADER_PERMS            = OPENRUN_HEADER_PREFIX + "Perms"
 	OPENRUN_HEADER_APP_RBAC_ENABLED = OPENRUN_HEADER_PREFIX + "Rbac-Enabled"
 )
@@ -877,26 +882,4 @@ type Service struct {
 	Config      map[string]string `json:"config"`
 	CreateTime  time.Time         `json:"create_time"`
 	UpdateTime  time.Time         `json:"update_time"`
-}
-
-// Binding is a binding entry in the metadata database
-// A binding is a link between a service and a source service
-type Binding struct {
-	Id             string          `json:"id"`           // the id of the binding
-	Path           string          `json:"path"`         // the path of the binding
-	Source         string          `json:"source"`       // service id, or the base binding path
-	ServiceType    string          `json:"service_type"` // the type of the service
-	ServiceName    string          `json:"service_name"` // the name of the service
-	BaseBinding    string          `json:"base_binding"` // the base binding path
-	StagedMetadata BindingMetadata `json:"staged_metadata"`
-	Metadata       BindingMetadata `json:"metadata"`
-	CreateTime     time.Time       `json:"create_time"`
-	UpdateTime     time.Time       `json:"update_time"`
-}
-
-type BindingMetadata struct {
-	Grants    []string          `json:"grants"`
-	Config    map[string]string `json:"config"`
-	Account   map[string]string `json:"account"`
-	ApplyInfo []byte            `json:"apply_info"`
 }
